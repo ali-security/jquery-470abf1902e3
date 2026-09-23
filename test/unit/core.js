@@ -1341,6 +1341,53 @@ test("jQuery.parseHTML", function() {
 	equal( jQuery.parseHTML("<td><td>")[ 1 ].parentNode.nodeType, 11, "parentNode should be documentFragment" );
 });
 
+test("jQuery.parseHTML(<a href>) - gh-2965", function() {
+	expect( 1 );
+
+	var html = "<a href='test.html'></a>",
+		href = jQuery.parseHTML( html )[ 0 ].href;
+
+	ok( /\/test\.html$/.test( href ), "href is not lost after parsing anchor" );
+});
+
+if ( jQuery.support.createHTMLDocument ) {
+	test("jQuery.parseHTML - parses into an inert document", function() {
+		expect( 3 );
+
+		notStrictEqual( jQuery.parseHTML( "<div></div>" )[ 0 ].ownerDocument, document,
+			"Single tags are created in a separate, inert document" );
+		notStrictEqual( jQuery.parseHTML( "<div class='x'></div>" )[ 0 ].ownerDocument, document,
+			"Fragments are built in a separate, inert document" );
+		strictEqual( jQuery.parseHTML( "<div></div>", document )[ 0 ].ownerDocument, document,
+			"An explicit context is still honored" );
+	});
+
+	asyncTest("jQuery.parseHTML - does not execute inline event handlers", function() {
+		expect( 2 );
+
+		Globals.register("parseHTMLError");
+		Globals.register("parseHTMLControl");
+
+		jQuery.globalEval("parseHTMLError = false; parseHTMLControl = false;");
+
+		// Control: parsing into the live document -- the behavior before the fix --
+		// really does run the inline handler in this engine, so the assertion below
+		// cannot pass vacuously.
+		jQuery.parseHTML( "<img src=x onerror='parseHTMLControl = true'>", document );
+
+		// With no explicit context the markup is parsed in an inert document, so
+		// nothing is fetched and no inline handler runs.
+		jQuery.parseHTML( "<img src=x onerror='parseHTMLError = true'>" );
+
+		window.setTimeout(function() {
+			start();
+			ok( window.parseHTMLControl,
+				"control: onerror eventhandler runs when parsing into the live document" );
+			equal( window.parseHTMLError, false, "onerror eventhandler has not been called." );
+		}, 2000);
+	});
+}
+
 test("jQuery.parseJSON", function() {
 	expect( 20 );
 
