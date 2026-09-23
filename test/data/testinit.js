@@ -251,9 +251,24 @@ this.testIframeWithCallback = function( title, fileName, func ) {
 				start();
 			}, 0 );
 		};
-		iframe = jQuery( "<div/>" ).css({ position: "absolute", width: "500px", left: "-600px" })
-			.append( jQuery( "<iframe/>" ).attr( "src", url( "./data/" + fileName ) ) )
-			.appendTo( "#qunit-fixture" );
+		// Mounted on <body> at the viewport origin rather than inside #qunit-fixture.
+		// QUnit parks #qunit-fixture at top/left -10000px, and this helper additionally
+		// offset the container to left:-600px, so on QtWebKit 534.34 (PhantomJS 1.9.8,
+		// the headless CI engine) the nested iframe was laid out late or not at all.
+		// Fixtures that measure during parse -- before document ready -- then read
+		// unlaid-out values: css #14084 saw "20px" (padding only) instead of "100px",
+		// and jQuery.support.shrinkWrapBlocks computed true instead of false, which
+		// also broke the support CSP test's deepEqual of the whole support object.
+		// visibility:hidden keeps the frame invisible while still forcing layout, and
+		// the iframeCallback above already removes the container, so nothing leaks into
+		// later tests.
+		iframe = jQuery( "<div/>" ).css({
+				position: "absolute", top: "0", left: "0",
+				width: "500px", height: "500px", visibility: "hidden"
+			})
+			.append( jQuery( "<iframe/>" )
+				.attr({ width: "500", height: "500", src: url( "./data/" + fileName ) }) )
+			.appendTo( "body" );
 	});
 };
 window.iframeCallback = undefined;

@@ -1,3 +1,139 @@
 language: node_js
 node_js:
 - '0.10'
+
+# Focal is pinned explicitly: the headless suite needs a distro that still
+# carries the 32/64-bit runtime libs PhantomJS 1.9.8 links against
+# (libfontconfig1 / libfreetype6) *and* a packaged mod_php.
+dist: focal
+
+before_install:
+# ---------------------------------------------------------------------------
+# System packages. Travis runs as a non-root user, so every privileged step
+# below goes through sudo.
+# ---------------------------------------------------------------------------
+- sudo apt-get update -qq
+- sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+  curl bzip2 ca-certificates apache2 libapache2-mod-php libfontconfig1 libfreetype6
+  fontconfig
+
+# ---------------------------------------------------------------------------
+# PhantomJS 1.9.8 -- deliberately NOT 2.1.1.
+#
+# PhantomJS 2.1.1 segfaults partway through test/unit/ajax.js on the JSONP
+# POST cases, which kills the process and takes the whole module's results
+# with it. 1.9.8 runs the same assertions to completion.
+#
+# The historical bitbucket.org download now answers 403, so the binary comes
+# from the Medium/phantomjs mirror (v1.9.19 is the npm-wrapper release tag;
+# the payload inside is the 1.9.8 linux-x86_64 build).
+#
+# `phantomjs --version` is a real command, not a diagnostic echo: a truncated
+# or wrong-arch download fails the leg here rather than 18 modules later.
+# ---------------------------------------------------------------------------
+- |
+  set -e
+  curl -sSfL -o /tmp/phantomjs.tar.bz2 \
+    https://github.com/Medium/phantomjs/releases/download/v1.9.19/phantomjs-1.9.8-linux-x86_64.tar.bz2
+  sudo mkdir -p /opt
+  sudo tar -xjf /tmp/phantomjs.tar.bz2 -C /opt
+  sudo ln -sf /opt/phantomjs-1.9.8-linux-x86_64/bin/phantomjs /usr/local/bin/phantomjs
+  phantomjs --version
+
+# ---------------------------------------------------------------------------
+# Apache + mod_php serving the checkout root on :8000 -- deliberately NOT
+# `php -S`.
+#
+# The PHP built-in dev server drops connections under the concurrency this
+# suite generates (parallel module fetches plus blocking fixtures such as
+# test/data/core/dont_return.php, which sleeps 30s, and
+# test/data/name.php?wait=5). A dropped static fetch makes the harness wait
+# forever so QUnit never starts; a dropped POST surfaces as a JSONP "Unknown
+# error". Apache with mod_php on the prefork MPM serves the same tree without
+# either failure mode.
+#
+# The vhost is generated at runtime from $PWD rather than shipped as a static
+# conf: Travis checks out to /home/travis/build/<owner>/<repo>, not a fixed
+# path.
+# ---------------------------------------------------------------------------
+- |
+  set -e
+  echo "Listen 8000" | sudo tee /etc/apache2/ports.conf
+  printf '<VirtualHost *:8000>\n  DocumentRoot %s\n  <Directory %s>\n    Options Indexes FollowSymLinks\n    AllowOverride None\n    Require all granted\n  </Directory>\n</VirtualHost>\n' "$PWD" "$PWD" | sudo tee /etc/apache2/sites-available/000-default.conf
+  echo "ServerName 127.0.0.1" | sudo tee /etc/apache2/conf-available/servername.conf
+
+# The www-data worker must be able to traverse every directory from / down to
+# the checkout (Travis creates /home/travis/build with group-only access), and
+# read every file under it.
+- |
+  set -e
+  sudo chmod -R o+rX "$PWD"
+  d="$PWD"
+  while [ "$d" != "/" ]; do
+    sudo chmod o+x "$d"
+    d=$(dirname "$d")
+  done
+
+# mod_php requires the prefork MPM; focal defaults to event. Query the active
+# MPM and swap it only when it is not already prefork. The PHP module name is
+# discovered from mods-available rather than guessed, so a focal PHP other
+# than 7.4 still enables correctly.
+- |
+  set -e
+  mpm=$(sudo a2query -M)
+  if [ "$mpm" != "prefork" ]; then
+    sudo a2dismod "mpm_${mpm}"
+    sudo a2enmod mpm_prefork
+  fi
+  php_mod=$(basename "$(ls /etc/apache2/mods-available/php*.load | head -1)" .load)
+  echo "enabling apache php module: ${php_mod}"
+  sudo a2enmod "$php_mod"
+  sudo a2enconf servername
+  sudo apache2ctl configtest
+  sudo apache2ctl restart
+
+# Bounded readiness wait: a server that never comes up fails the leg instead
+# of hanging until the Travis job timeout.
+- |
+  set -e
+  n=0
+  until curl -sf -o /dev/null http://127.0.0.1:8000/test/index.html; do
+    n=$((n + 1))
+    if [ "$n" -ge 60 ]; then
+      echo "ERROR: apache did not serve /test/index.html on :8000 within ${n}s"
+      sudo tail -n 50 /var/log/apache2/error.log
+      exit 1
+    fi
+    sleep 1
+  done
+  echo "apache ready on http://127.0.0.1:8000/"
+
+# Warm Apache/mod_php and the OS page cache before any module runs. The first
+# module otherwise absorbs cold-start latency for the 283KB dist/jquery.js plus
+# the PHP fixtures, and has been observed timing out with zero tests reported.
+- |
+  set -e
+  for u in /test/index.html /dist/jquery.js /dist/jquery.min.js /test/data/testinit.js /test/data/testrunner.js /test/data/name.php; do
+    curl -sf -o /dev/null "http://127.0.0.1:8000${u}"
+  done
+  echo "warm-up fetches complete"
+
+# Sanity-check that mod_php executes .php instead of serving it as text. If
+# the source leaks through, every ajax fixture would silently return markup
+# and the ajax module would fail in confusing ways.
+- |
+  set -e
+  body=$(curl -s http://127.0.0.1:8000/test/data/name.php)
+  printf '%s' "$body" | head -c 50
+  echo
+  if printf '%s' "$body" | grep -q '<?php'; then
+    echo "ERROR: PHP served as text -- mod_php is not executing"
+    exit 1
+  fi
+  echo "php execution confirmed"
+
+script:
+# grunt: jsonlint + build + jshint + jscs + uglify + dist
+- npm test
+# the 800-test QUnit suite, one PhantomJS process per module
+- ./run-tests.sh

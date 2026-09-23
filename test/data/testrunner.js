@@ -16,7 +16,10 @@ var reset,
 
 // Max time for stop() and asyncTest() until it aborts test
 // and start()'s the next test.
-QUnit.config.testTimeout = 2e4; // 20 seconds
+// Raised from the upstream 20s: the headless CI engine (PhantomJS 1.9.8) runs in a
+// resource-constrained container where the iframe-loading and concurrent-ajax tests
+// intermittently exceed 20s. 60s removes that flakiness without masking real failures.
+QUnit.config.testTimeout = 6e4; // 60 seconds
 
 // Enforce an "expect" argument or expect() call in all test bodies.
 QUnit.config.requireExpects = true;

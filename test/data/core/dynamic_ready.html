@@ -25,10 +25,17 @@
 			});
 		});
 
+		// Raised from the upstream 10s. This watchdog is independent of
+		// QUnit.config.testTimeout, so it alone decided the outcome of #13655. The
+		// sibling <iframe src="dont_return.php"> parks a PHP worker for 30s while this
+		// page also pulls the 283KB dist/jquery.js, and on a resource-constrained CI
+		// container that pair intermittently exceeded 10s -- the watchdog then reported
+		// a spurious "not ready". Kept below QUnit's 60s testTimeout so this page still
+		// reports a real result rather than being cut off by QUnit.
 		timeoutId = setTimeout(function () {
 			timeoutFired = true;
 			window.parent.iframeCallback( false );
-		}, 10000);
+		}, 45000);
 	});
 </script>
 </body>

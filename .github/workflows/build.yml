@@ -1,0 +1,165 @@
+name: build
+
+# Build-and-pack only. The test suite is owned by .travis.yml (node 0.10,
+# `npm install && npm test`), which already runs green; this workflow exists
+# solely to reproduce the published jquery-1.11.1.tgz artifact.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and pack jquery 1.11.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # node 0.10 cannot be provisioned by actions/setup-node on a modern
+      # runner, so the whole build runs inside the official image instead.
+      # Order matters:
+      #   1. pin the registry to the 1.11.1 release date -- the dependency
+      #      ranges in package.json resolve transitively to a newer uglify-js
+      #      today, and that drift changes the minified output.
+      #   2. `npm install` with the image's bundled npm, which can still talk
+      #      to the registry, so grunt 0.4.2 and friends resolve.
+      #   3. the grunt default task, which populates the gitignored dist/
+      #      (dist/jquery.js, dist/jquery.min.js, dist/jquery.min.map) that the
+      #      published tarball ships and that package.json points "main" at.
+      #   4. dist/cdn/, the nine extra files the published tarball ships. They
+      #      come from makeReleaseCopies() in build/release.js, which is driven
+      #      by the external jquery-release runner rather than by grunt, so the
+      #      same logic is replayed inline here.
+      #   5. removal of build-only cruft that npm pack would otherwise include.
+      #   6. npm@1.2.25 installed globally only now -- it is the exact npm that
+      #      packed the public tarball, and it must not be the npm that
+      #      performs the dependency install above.
+      #   7. `npm pack`, which honours the existing .npmignore.
+      - name: Build and pack in node:0.10-wheezy
+        run: |
+          docker run --rm \
+            -v "$PWD":/w \
+            -w /w \
+            node:0.10-wheezy \
+            sh -e -x -c '
+              node --version
+              npm --version
+
+              # Time-machine registry frozen at the 1.11.1 publish timestamp.
+              # The colons of the ISO timestamp are percent-encoded because the
+              # timestamp sits in the userinfo portion of the URL.
+              npm config set registry https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm.sealsecurity.io/
+
+              npm install
+              ./node_modules/.bin/grunt
+
+              # Replay makeReleaseCopies() from build/release.js with
+              # Release.newVersion = "1.11.1" and Release.preRelease falsy, so
+              # all nine release copies get written. The script itself lives
+              # outside the work tree so it can never end up in the tarball.
+              mkdir -p dist/cdn
+              cat > /tmp/make-release-copies.js <<"MAKE_RELEASE_COPIES"
+          var fs = require( "fs" );
+
+          var devFile = "dist/jquery.js",
+              minFile = "dist/jquery.min.js",
+              mapFile = "dist/jquery.min.map",
+
+              cdnFolder = "dist/cdn",
+              newVersion = "1.11.1",
+
+              releaseFiles = {
+                  "jquery-VER.js": devFile,
+                  "jquery-VER.min.js": minFile,
+                  "jquery-VER.min.map": mapFile,
+                  "jquery.js": devFile,
+                  "jquery.min.js": minFile,
+                  "jquery.min.map": mapFile,
+                  "jquery-latest.js": devFile,
+                  "jquery-latest.min.js": minFile,
+                  "jquery-latest.min.map": mapFile
+              };
+
+          Object.keys( releaseFiles ).forEach(function( key ) {
+              var text,
+                  builtFile = releaseFiles[ key ],
+                  unpathedFile = key.replace( /VER/g, newVersion ),
+                  releaseFile = cdnFolder + "/" + unpathedFile;
+
+              if ( /\.map$/.test( releaseFile ) ) {
+                  // Map files need to reference the new uncompressed name;
+                  // assume that all files reside in the same directory.
+                  // "file":"jquery.min.js","sources":["jquery.js"]
+                  text = fs.readFileSync( builtFile, "utf8" )
+                      .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                          "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                          "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+                  fs.writeFileSync( releaseFile, text );
+              } else if ( /\.min\.js$/.test( releaseFile ) ) {
+                  // Remove the source map comment; it causes way too many problems.
+                  // Keep the map file in case DevTools allow manual association.
+                  text = fs.readFileSync( builtFile, "utf8" )
+                      .replace( /\/\/# sourceMappingURL=\S+/, "" );
+                  fs.writeFileSync( releaseFile, text );
+              } else {
+                  fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+              }
+
+              console.log( "wrote " + releaseFile );
+          });
+          MAKE_RELEASE_COPIES
+              node /tmp/make-release-copies.js
+              ls -l dist/cdn
+
+              # .npmignore is itself a packed member of the published tarball,
+              # so it ships verbatim and cannot be extended to cover these
+              # paths; they are removed from the work tree instead.
+              # run-qunit.js and run-tests.sh are CI test-harness files driving
+              # the headless QUnit suite from .travis.yml, not package members.
+              rm -rf .github bower_components
+              rm -f .sizecache.json run-qunit.js run-tests.sh
+
+              npm install -g npm@1.2.25
+              npm --version
+
+              # npm 1.2.25 packs by copying the whole work tree into its tmp
+              # dir with fstream before tarring. On the Docker bind mount, with
+              # node_modules/ fully populated (grunt + ~40 dev deps), that is
+              # both very slow and hits a known EEXIST race in the bundled
+              # fstream/mkdirp 0.3. Pack from a pristine copy on the container
+              # filesystem instead -- no node_modules, no .git -- and move
+              # npm tmp off the mount as well. The packed members are
+              # unaffected: .npmignore still governs, and neither node_modules/
+              # nor .git/ is a member of the published tarball.
+              mkdir -p /tmp/npmtmp
+              npm config set tmp /tmp/npmtmp
+
+              rm -rf /tmp/packsrc
+              mkdir -p /tmp/packsrc
+              tar -cf - --exclude=./node_modules --exclude=./.git . | ( cd /tmp/packsrc && tar -xf - )
+
+              cd /tmp/packsrc
+              npm pack || { cat /tmp/packsrc/npm-debug.log 2>/dev/null; exit 1; }
+              cp /tmp/packsrc/jquery-1.11.1.tgz /w/
+              cd /w
+
+              # Diagnostic only: the exact member list of the produced tarball.
+              tar tzf /w/jquery-1.11.1.tgz | sort
+            '
+
+      # The container runs as root, so dist/, node_modules/ and the packed
+      # tarball land on the host owned by root. Hand the workspace back to the
+      # runner user so actions/upload-artifact can read the tarball.
+      - name: Restore workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD"
+
+      - name: Show packed tarball
+        run: ls -l jquery-1.11.1.tgz
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: jquery-tarball
+          path: jquery-1.11.1.tgz
+          if-no-files-found: error
